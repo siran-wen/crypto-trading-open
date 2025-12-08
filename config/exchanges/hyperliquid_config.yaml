@@ -15,8 +15,8 @@ hyperliquid:
   # 认证配置 - 用于私有API调用
   # 💡 说明：Hyperliquid使用钱包签名认证，只需要2个字段
   authentication:
-    private_key: '111111111111'                      # 🔑 钱包私钥(用于签名认证) - 必填
-    wallet_address: '1111111111111'                   # 📍 钱包地址 - 必填
+    private_key: '0xd4db493b2c19176df395febdeee106756485ad0b8d6a3a5c778d5d7d91a5f4c4'                      # 🔑 钱包私钥(用于签名认证) - 必填
+    wallet_address: '0x16Ae0677A72c400b1550cEe19aa8Ca672134783F'                   # 📍 钱包地址 - 必填
   # 自定义订阅配置 - 定义预设的订阅组合
   custom_subscriptions:
     # 当前激活的订阅组合
@@ -27,10 +27,10 @@ hyperliquid:
       # 完整数据组合
       full_data:
         data_types:
-          orderbook: false    # 订单簿数据
+          orderbook: true    # 订单簿数据
           ticker: true        # 价格数据 (推荐)
-          trades: false       # 交易数据
-          user_data: false    # 用户数据
+          trades: true       # 交易数据
+          user_data: true    # 用户数据
         description: 🔥 永续合约价格数据订阅
         symbols:
         - BTC/USDC:PERP

@@ -80,6 +80,8 @@ class LighterWebSocket(LighterBase):
         # 数据缓存
         self._order_books: Dict[str, OrderBookData] = {}
         self._account_data: Dict[str, Any] = {}
+        # 🔥 订单缓存（供get_open_orders使用，避免REST API的token过期问题）
+        self._order_cache: Dict[str, OrderData] = {}  # {order_id: OrderData}
         # 🔥 持仓缓存（供position_monitor使用）
         self._position_cache: Dict[str, Dict[str, Any]] = {}
         # 🔥 余额缓存（供balance_monitor使用）
@@ -1475,10 +1477,49 @@ class LighterWebSocket(LighterBase):
                 if "orders" in data:
                     orders_data = data["orders"]
                     logger.info(f"📦 account_all包含订单数据: {len(orders_data)} 个市场")
-                    # 订单数据的处理逻辑和account_all_orders一样
-                    for market_index_str, orders in orders_data.items():
-                        for order_info in orders:
-                            await self._on_order_update(order_info)
+                    
+                    # 🔥 使用与account_all_orders相同的处理逻辑，更新订单缓存
+                    if isinstance(orders_data, dict):
+                        # 🔥 清空旧缓存，因为WebSocket推送的是全量订单数据
+                        self._order_cache.clear()
+                        
+                        for market_index_str, order_list in orders_data.items():
+                            if isinstance(order_list, list):
+                                logger.debug(
+                                    f"📡 [WS] account_all 市场{market_index_str}: {len(order_list)} 个订单")
+                                for order_info in order_list:
+                                    # 解析订单（使用完整的Order JSON格式）
+                                    order = self._parse_order_from_direct_ws(order_info)
+                                    if order:
+                                        logger.debug(
+                                            f"📡 [WS] account_all 订单: id={order.id}, client_id={order.client_id or 'N/A'}, "
+                                            f"{order.side.value} {order.status.value}, "
+                                            f"{order.price}, 已成交={order.filled}")
+
+                                        # 🔥 更新订单缓存（只缓存活跃订单）
+                                        if order.status == OrderStatus.OPEN:
+                                            self._order_cache[order.id] = order
+                                        else:
+                                            # 移除已完成的订单
+                                            self._order_cache.pop(order.id, None)
+
+                                        # 触发订单回调
+                                        if self._order_callbacks:
+                                            for callback in self._order_callbacks:
+                                                if asyncio.iscoroutinefunction(callback):
+                                                    await callback(order)
+                                                else:
+                                                    callback(order)
+
+                                        # 如果是成交状态，触发成交回调
+                                        if order.status == OrderStatus.FILLED and self._order_fill_callbacks:
+                                            for callback in self._order_fill_callbacks:
+                                                if asyncio.iscoroutinefunction(callback):
+                                                    await callback(order)
+                                                else:
+                                                    callback(order)
+                                    else:
+                                        logger.warning(f"⚠️ account_all 订单解析失败: {order_info}")
 
                 return  # account_all已经包含所有数据，不需要继续处理
 
@@ -1521,9 +1562,12 @@ class LighterWebSocket(LighterBase):
             # 处理订单更新（account_all_orders）
             if msg_type == "update/account_all_orders" and "orders" in data:
                 orders_data = data["orders"]
-                logger.debug(f"📡 [WS] 订单推送: {len(orders_data)} 个市场")
+                logger.info(f"📡 [WS] 收到订单推送: {len(orders_data)} 个市场")
 
                 if isinstance(orders_data, dict):
+                    # 🔥 清空旧缓存，因为WebSocket推送的是全量订单数据
+                    self._order_cache.clear()
+                    
                     for market_index, order_list in orders_data.items():
                         if isinstance(order_list, list):
                             logger.debug(
@@ -1537,6 +1581,13 @@ class LighterWebSocket(LighterBase):
                                         f"📡 [WS] 订单: id={order.id}, client_id={order.client_id or 'N/A'}, "
                                         f"{order.side.value} {order.status.value}, "
                                         f"{order.price}, 已成交={order.filled}")
+
+                                    # 🔥 更新订单缓存（只缓存活跃订单）
+                                    if order.status == OrderStatus.OPEN:
+                                        self._order_cache[order.id] = order
+                                    else:
+                                        # 移除已完成的订单
+                                        self._order_cache.pop(order.id, None)
 
                                     # 触发订单回调
                                     if self._order_callbacks:
@@ -1559,6 +1610,12 @@ class LighterWebSocket(LighterBase):
             # 处理订阅确认
             elif msg_type.startswith("subscribed/"):
                 logger.info(f"✅ 订阅成功: {channel or msg_type}")
+                # 🔥 特别记录 account_all_orders 的订阅成功
+                if "account_all_orders" in (channel or msg_type):
+                    logger.info(f"🎉 account_all_orders 订阅成功！等待订单推送...")
+                # 🔥 特别记录 account_all 的订阅成功（包含订单数据）
+                elif "account_all" in (channel or msg_type):
+                    logger.info(f"🎉 account_all 订阅成功！该频道包含订单、持仓和成交数据")
 
             # 🔥 处理market_stats更新
             elif msg_type in ("subscribed/market_stats", "update/market_stats") and "market_stats" in data:
@@ -1733,6 +1790,48 @@ class LighterWebSocket(LighterBase):
         except Exception as e:
             logger.error(f"解析订单失败: {e}", exc_info=True)
             return None
+
+    def get_open_orders_from_ws(self, symbol: Optional[str] = None) -> List[OrderData]:
+        """
+        从WebSocket缓存中获取活跃订单
+        
+        🔥 优先使用WebSocket缓存，避免REST API的token过期问题
+        
+        Args:
+            symbol: 交易对符号（可选），None表示获取所有订单
+            
+        Returns:
+            OrderData列表
+        """
+        orders = []
+        
+        try:
+            logger.debug(f"🔍 从WebSocket缓存获取订单 (symbol={symbol}, 缓存大小={len(self._order_cache)})")
+            
+            # 从订单缓存中获取
+            for order_id, order in self._order_cache.items():
+                # 只返回活跃订单（已经在缓存时过滤了）
+                if order.status == OrderStatus.OPEN:
+                    # 如果指定了symbol，过滤
+                    if symbol:
+                        if order.symbol == symbol:
+                            orders.append(order)
+                    else:
+                        orders.append(order)
+            
+            if orders:
+                logger.info(f"✅ 从WebSocket缓存获取到 {len(orders)} 个活跃订单 (symbol={symbol})")
+            else:
+                if len(self._order_cache) == 0:
+                    logger.warning(f"⚠️ WebSocket订单缓存为空，可能尚未收到订单推送或没有活跃订单")
+                else:
+                    logger.debug(f"WebSocket缓存中有 {len(self._order_cache)} 个订单，但没有活跃订单 (symbol={symbol})")
+            
+            return orders
+            
+        except Exception as e:
+            logger.error(f"从WebSocket缓存获取订单失败: {e}", exc_info=True)
+            return orders
 
     def get_cached_orderbook(self, symbol: str) -> Optional[OrderBookData]:
         """获取缓存的订单簿"""

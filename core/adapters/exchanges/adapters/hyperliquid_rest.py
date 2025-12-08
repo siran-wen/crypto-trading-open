@@ -335,6 +335,15 @@ class HyperliquidRest(HyperliquidBase):
     ) -> OrderData:
         """创建订单"""
         mapped_symbol = self.map_symbol(symbol)
+        
+        # 🔥 调试日志：记录订单参数（INFO级别以便查看）
+        if self.logger:
+            self.logger.info(
+                f"📝 创建订单参数: symbol={mapped_symbol}, "
+                f"order_type={order_type.value}, side={side.value}, "
+                f"amount={float(amount)}, price={float(price) if price else None}, "
+                f"params={params or {}}"
+            )
 
         order_data = await self._execute_with_retry(
             self._place_order,
@@ -576,9 +585,30 @@ class HyperliquidRest(HyperliquidBase):
         params: Dict[str, Any]
     ) -> Dict[str, Any]:
         """下单"""
-        return await asyncio.get_event_loop().run_in_executor(
-            None, self.exchange.create_order, symbol, order_type, side, amount, price, params
-        )
+        # 🔥 调试日志：记录ccxt调用参数（INFO级别以便查看）
+        if self.logger:
+            self.logger.info(
+                f"🔍 ccxt.create_order调用: symbol={symbol}, "
+                f"type={order_type}, side={side}, amount={amount}, "
+                f"price={price}, params={params}, defaultType={self.exchange.options.get('defaultType', 'unknown')}"
+            )
+        
+        # 🔥 确保params不为None（ccxt要求dict）
+        if params is None:
+            params = {}
+        
+        # 🔥 临时切换到swap类型（永续合约需要）
+        original_type = self.exchange.options.get('defaultType', 'spot')
+        self.exchange.options['defaultType'] = 'swap'
+        
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, self.exchange.create_order, symbol, order_type, side, amount, price, params
+            )
+            return result
+        finally:
+            # 恢复原来的类型
+            self.exchange.options['defaultType'] = original_type
 
     async def _cancel_single_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
         """取消单个订单"""

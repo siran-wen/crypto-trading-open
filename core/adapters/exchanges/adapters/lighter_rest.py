@@ -175,6 +175,11 @@ class LighterRest(LighterBase):
 
             # 如果配置了私钥，创建签名客户端
             if self.api_key_private_key:
+                # 🔥 调试：打印私钥信息（不打印完整私钥，只打印长度和前几个字符）
+                private_key_len = len(self.api_key_private_key)
+                private_key_preview = self.api_key_private_key[:20] + "..." if private_key_len > 20 else self.api_key_private_key
+                logger.info(f"🔍 调试：私钥长度={private_key_len}, 预览={private_key_preview}, account_index={self.account_index}, api_key_index={self.api_key_index}")
+                
                 self.signer_client = SignerClient(
                     url=self.base_url,
                     private_key=self.api_key_private_key,
@@ -220,6 +225,57 @@ class LighterRest(LighterBase):
             logger.error(f"Lighter REST客户端初始化失败: {e}")
             raise
 
+    async def _find_and_close_sessions(self, obj, visited=None):
+        """
+        递归查找并关闭所有 aiohttp ClientSession 对象（异步版本）
+        
+        Args:
+            obj: 要搜索的对象
+            visited: 已访问的对象集合（防止循环引用）
+        """
+        if visited is None:
+            visited = set()
+        
+        # 防止循环引用
+        obj_id = id(obj)
+        if obj_id in visited:
+            return
+        visited.add(obj_id)
+        
+        try:
+            import aiohttp
+            
+            # 如果对象本身就是 ClientSession，关闭它
+            if isinstance(obj, aiohttp.ClientSession):
+                if not obj.closed:
+                    try:
+                        await obj.close()
+                        logger.debug("✅ 已关闭一个 ClientSession")
+                    except Exception as e:
+                        logger.debug(f"关闭 ClientSession 时出错: {e}")
+                return
+            
+            # 递归搜索对象的属性
+            if hasattr(obj, '__dict__'):
+                for attr_name, attr_value in obj.__dict__.items():
+                    try:
+                        await self._find_and_close_sessions(attr_value, visited)
+                    except Exception:
+                        pass  # 忽略无法访问的属性
+            
+            # 如果是列表或元组，递归搜索每个元素
+            if isinstance(obj, (list, tuple)):
+                for item in obj:
+                    await self._find_and_close_sessions(item, visited)
+            
+            # 如果是字典，递归搜索每个值
+            if isinstance(obj, dict):
+                for value in obj.values():
+                    await self._find_and_close_sessions(value, visited)
+                    
+        except Exception as e:
+            logger.debug(f"搜索 ClientSession 时出错: {e}")
+
     async def close(self):
         """关闭连接"""
         try:
@@ -230,10 +286,26 @@ class LighterRest(LighterBase):
                 except Exception as ws_err:
                     logger.warning(f"断开WebSocket时出错: {ws_err}")
 
+            # 🔥 关闭 SignerClient 和 ApiClient
             if self.signer_client:
-                await self.signer_client.close()
+                try:
+                    await self.signer_client.close()
+                    # 递归查找并关闭 SignerClient 内部的所有 ClientSession
+                    await self._find_and_close_sessions(self.signer_client)
+                except Exception as e:
+                    logger.debug(f"关闭 SignerClient 时出错: {e}")
+            
             if self.api_client:
-                await self.api_client.close()
+                try:
+                    await self.api_client.close()
+                    # 递归查找并关闭 ApiClient 内部的所有 ClientSession
+                    await self._find_and_close_sessions(self.api_client)
+                except Exception as e:
+                    logger.debug(f"关闭 ApiClient 时出错: {e}")
+            
+            # 🔥 额外等待，确保所有异步操作完成
+            await asyncio.sleep(0.5)
+            
             self._connected = False
             logger.info("Lighter REST客户端已关闭")
         except Exception as e:
@@ -577,9 +649,73 @@ class LighterRest(LighterBase):
             traceback.print_exc()
             return []
 
+    def _is_token_expired_error(self, error: Exception) -> bool:
+        """
+        检测是否是 token 过期错误
+        
+        Args:
+            error: 异常对象
+            
+        Returns:
+            是否是 token 过期错误
+        """
+        # 获取异常的字符串表示
+        error_str = str(error).lower()
+        error_repr = repr(error).lower()
+        
+        # 检测多种 token 过期错误格式
+        token_expired_indicators = [
+            "expired token",
+            "invalid auth: expired token",
+            "401",
+            "unauthorized",
+            "20013",  # Lighter 特定的错误代码
+            "code:20013",  # JSON 格式的错误代码
+            '"code":20013',  # JSON 格式（带引号）
+        ]
+        
+        # 检查异常字符串
+        for indicator in token_expired_indicators:
+            if indicator in error_str or indicator in error_repr:
+                logger.debug(f"🔍 检测到 token 过期指示符: {indicator}")
+                return True
+        
+        # 检查异常对象的属性（Lighter SDK 的 ApiException 可能有 status、body 等属性）
+        if hasattr(error, 'status'):
+            status = getattr(error, 'status', None)
+            if status == 401:
+                logger.debug(f"🔍 检测到 HTTP 401 状态码")
+                return True
+        
+        if hasattr(error, 'body'):
+            body = str(getattr(error, 'body', ''))
+            if any(indicator in body.lower() for indicator in token_expired_indicators):
+                logger.debug(f"🔍 检测到 token 过期错误在 body 中: {body[:100]}")
+                return True
+        
+        if hasattr(error, 'reason'):
+            reason = str(getattr(error, 'reason', '')).lower()
+            if "unauthorized" in reason:
+                logger.debug(f"🔍 检测到 Unauthorized reason")
+                return True
+        
+        # 检查是否有 api_err 属性
+        if hasattr(error, 'api_err'):
+            api_err_str = str(getattr(error, 'api_err', '')).lower()
+            if any(indicator in api_err_str for indicator in token_expired_indicators):
+                logger.debug(f"🔍 检测到 token 过期错误在 api_err 中")
+                return True
+        
+        # 🔥 最后检查：如果异常字符串包含 "401" 和 "expired" 或 "unauthorized"
+        if "401" in error_str and ("expired" in error_str or "unauthorized" in error_str):
+            logger.debug(f"🔍 检测到 401 + expired/unauthorized 组合")
+            return True
+        
+        return False
+
     async def get_open_orders(self, symbol: Optional[str] = None) -> List[OrderData]:
         """
-        获取活跃订单
+        获取活跃订单（支持 token 过期自动重试）
 
         Args:
             symbol: 交易对符号（可选，为None时获取所有）
@@ -591,55 +727,259 @@ class LighterRest(LighterBase):
             logger.error("未配置SignerClient，无法获取订单信息")
             return []
 
-        try:
-            # 🔥 修复：Lighter 需要使用专门的订单查询 API，而不是 account API
-            # 生成认证令牌（使用SDK推荐的10分钟过期时间）
-            import lighter
-            auth_token, err = self.signer_client.create_auth_token_with_expiry(
-                lighter.SignerClient.DEFAULT_10_MIN_AUTH_EXPIRY
-            )
-            if err:
-                logger.error(f"生成认证令牌失败: {err}")
-                return []
-
-            # 获取 market_id
-            market_id = None
-            if symbol:
-                market_id = self.get_market_index(symbol)
-                if market_id is None:
-                    logger.warning(f"未找到交易对 {symbol} 的市场索引")
-                    return []
-
-            # 使用 account_active_orders API（SDK 方法是异步的，直接 await）
-            response = await self.order_api.account_active_orders(
-                account_index=self.account_index,
-                market_id=market_id if market_id is not None else 255,  # 255 = 所有市场
-                auth=auth_token
-            )
-
-            orders = []
-
-            # 🔥 account_active_orders 返回 orders 列表，不是 accounts
-            if hasattr(response, 'orders') and response.orders:
-                logger.info(f"🔍 REST API返回 {len(response.orders)} 个活跃订单")
-
-                for order_info in response.orders:
-                    order_symbol = self._get_symbol_from_market_index(
-                        getattr(order_info, 'market_index', None))
-
-                    # 如果指定了symbol，过滤
-                    if symbol and order_symbol != symbol:
+        max_retries = 3  # 最多重试3次（初始尝试 + 2次重试）
+        
+        for attempt in range(max_retries):
+            try:
+                # 🔥 在重试前检查 SignerClient 状态
+                if attempt > 0:
+                    import time
+                    logger.info(f"🔄 重试前检查 SignerClient 状态 (尝试 {attempt + 1}/{max_retries})...")
+                    err = self.signer_client.check_client()
+                    if err is not None:
+                        error_msg = self.parse_error(err)
+                        logger.warning(f"⚠️ SignerClient 状态检查失败: {error_msg}，尝试重新初始化...")
+                        # 尝试重新创建 SignerClient
+                        try:
+                            import lighter
+                            self.signer_client = SignerClient(
+                                url=self.base_url,
+                                private_key=self.api_key_private_key,
+                                account_index=self.account_index,
+                                api_key_index=self.api_key_index,
+                            )
+                            err = self.signer_client.check_client()
+                            if err is not None:
+                                logger.error(f"❌ 重新初始化 SignerClient 失败: {self.parse_error(err)}")
+                                return []
+                            logger.info(f"✅ SignerClient 重新初始化成功")
+                        except Exception as init_err:
+                            logger.error(f"❌ 重新初始化 SignerClient 异常: {init_err}")
+                            return []
+                    else:
+                        logger.info(f"✅ SignerClient 状态检查通过")
+                
+                # 🔥 修复：Lighter 需要使用专门的订单查询 API，而不是 account API
+                # 生成认证令牌（使用SDK推荐的10分钟过期时间）
+                import lighter
+                import time
+                token_start_time = time.time()
+                logger.info(f"🔑 正在生成认证令牌 (尝试 {attempt + 1}/{max_retries})...")
+                auth_token, err = self.signer_client.create_auth_token_with_expiry(
+                    lighter.SignerClient.DEFAULT_10_MIN_AUTH_EXPIRY
+                )
+                token_gen_time = time.time() - token_start_time
+                if err:
+                    logger.error(f"❌ 生成认证令牌失败: {err} (耗时 {token_gen_time:.3f}秒)")
+                    # 如果是 token 生成失败，也尝试重试
+                    if attempt < max_retries - 1:
+                        logger.warning(f"⚠️ Token 生成失败，等待后重试...")
+                        await asyncio.sleep(1.0)  # 等待更长时间
                         continue
+                    return []
+                # 🔥 诊断：验证token是否由SDK正确生成
+                if not auth_token:
+                    logger.error(f"❌ Token生成失败：auth_token为空或None")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1.0)
+                        continue
+                    return []
+                
+                # 🔥 诊断：记录token的基本信息（不记录完整token，只记录前20个字符用于验证）
+                token_preview = auth_token[:20] + "..." if len(auth_token) > 20 else auth_token
+                logger.info(f"✅ 认证令牌生成成功 (耗时 {token_gen_time:.3f}秒, token长度={len(auth_token)}, 预览={token_preview})")
+                
+                # 🔥 诊断：检查系统时间同步问题
+                import datetime
+                system_time = datetime.datetime.now()
+                logger.debug(f"🔍 系统时间: {system_time.isoformat()}")
 
-                    orders.append(self._parse_order(order_info, order_symbol))
-            else:
-                logger.info(f"✅ REST API确认无活跃订单")
+                # 获取 market_id
+                market_id = None
+                if symbol:
+                    market_id = self.get_market_index(symbol)
+                    if market_id is None:
+                        logger.warning(f"未找到交易对 {symbol} 的市场索引")
+                        return []
 
-            return orders
+                # 使用 account_active_orders API（SDK 方法是异步的，直接 await）
+                api_start_time = time.time()
+                time_since_token_gen = api_start_time - token_start_time
+                logger.info(f"📡 调用 API (token生成后 {time_since_token_gen:.3f}秒)...")
+                
+                # 🔥 诊断：如果时间差过大，记录警告
+                if time_since_token_gen > 1.0:
+                    logger.warning(f"⚠️ Token生成到API调用的时间差较大: {time_since_token_gen:.3f}秒，可能影响token有效性")
+                
+                # 🔥 诊断：验证token是否正确传递给API
+                if not auth_token:
+                    logger.error(f"❌ Token为空，无法传递给API")
+                    return []
+                
+                logger.debug(f"🔍 准备调用API: account_index={self.account_index}, market_id={market_id if market_id is not None else 255}, token长度={len(auth_token)}")
+                response = await self.order_api.account_active_orders(
+                    account_index=self.account_index,
+                    market_id=market_id if market_id is not None else 255,  # 255 = 所有市场
+                    auth=auth_token  # 🔥 Token由Lighter SDK的SignerClient生成，直接传递给SDK的OrderApi
+                )
+                api_time = time.time() - api_start_time
+                logger.info(f"✅ API 调用成功 (耗时 {api_time:.3f}秒)")
 
-        except Exception as e:
-            logger.error(f"获取活跃订单失败: {e}")
-            return []
+                orders = []
+
+                # 🔥 account_active_orders 返回 orders 列表，不是 accounts
+                if hasattr(response, 'orders') and response.orders:
+                    logger.info(f"🔍 REST API返回 {len(response.orders)} 个活跃订单")
+
+                    for order_info in response.orders:
+                        order_symbol = self._get_symbol_from_market_index(
+                            getattr(order_info, 'market_index', None))
+
+                        # 如果指定了symbol，过滤
+                        if symbol and order_symbol != symbol:
+                            continue
+
+                        orders.append(self._parse_order(order_info, order_symbol))
+                else:
+                    logger.info(f"✅ REST API确认无活跃订单")
+
+                return orders
+
+            except Exception as e:
+                # 🔥 检测 token 过期错误并自动重试
+                is_token_expired = self._is_token_expired_error(e)
+                
+                if is_token_expired:
+                    logger.warning(f"⚠️ 检测到 token 过期错误 (尝试 {attempt + 1}/{max_retries})")
+                    logger.info(f"错误详情: {type(e).__name__}: {e}")
+                    
+                    # 🔥 详细的错误诊断信息
+                    logger.info("=" * 80)
+                    logger.info("🔍 详细错误诊断信息")
+                    logger.info("=" * 80)
+                    
+                    # 1. HTTP响应信息
+                    if hasattr(e, 'status'):
+                        logger.info(f"📡 HTTP 状态码: {e.status}")
+                    if hasattr(e, 'reason'):
+                        logger.info(f"📡 HTTP 原因: {e.reason}")
+                    if hasattr(e, 'body'):
+                        logger.info(f"📡 HTTP 响应体: {e.body}")
+                    
+                    # 2. Token信息
+                    logger.info(f"🔑 Token信息:")
+                    logger.info(f"   - Token长度: {len(auth_token) if auth_token else 0}")
+                    logger.info(f"   - Token预览: {auth_token[:30] + '...' if auth_token and len(auth_token) > 30 else auth_token}")
+                    logger.info(f"   - Token生成耗时: {token_gen_time:.3f}秒")
+                    logger.info(f"   - Token生成到API调用时间差: {time_since_token_gen:.3f}秒")
+                    
+                    # 3. SignerClient信息
+                    logger.info(f"🔧 SignerClient信息:")
+                    logger.info(f"   - Account Index: {self.account_index}")
+                    logger.info(f"   - API Key Index: {self.api_key_index}")
+                    logger.info(f"   - Base URL: {self.base_url}")
+                    if self.signer_client:
+                        try:
+                            err_check = self.signer_client.check_client()
+                            logger.info(f"   - SignerClient状态: {'正常' if err_check is None else f'异常: {err_check}'}")
+                        except Exception as check_err:
+                            logger.info(f"   - SignerClient状态检查失败: {check_err}")
+                    
+                    # 4. SDK版本信息
+                    try:
+                        import lighter
+                        sdk_version = getattr(lighter, '__version__', '未知')
+                        logger.info(f"📦 SDK版本信息:")
+                        logger.info(f"   - lighter版本: {sdk_version}")
+                        # 检查是否有DEFAULT_10_MIN_AUTH_EXPIRY常量
+                        if hasattr(lighter.SignerClient, 'DEFAULT_10_MIN_AUTH_EXPIRY'):
+                            expiry = lighter.SignerClient.DEFAULT_10_MIN_AUTH_EXPIRY
+                            if expiry == -1:
+                                logger.info(f"   - 默认Token过期时间: {expiry} (使用SDK默认值，通常为10分钟)")
+                            else:
+                                logger.info(f"   - 默认Token过期时间: {expiry}秒 ({expiry/60:.1f}分钟)")
+                        else:
+                            logger.warning(f"   - DEFAULT_10_MIN_AUTH_EXPIRY 常量不存在，SDK版本可能过旧")
+                    except Exception as sdk_err:
+                        logger.warning(f"   - 无法获取SDK版本: {sdk_err}")
+                    
+                    # 5. 系统时间信息
+                    import datetime
+                    system_time = datetime.datetime.now()
+                    utc_time = datetime.datetime.utcnow()
+                    logger.info(f"⏰ 系统时间信息:")
+                    logger.info(f"   - 本地时间: {system_time.isoformat()}")
+                    logger.info(f"   - UTC时间: {utc_time.isoformat()}")
+                    logger.info(f"   - 时间差: {(system_time - utc_time).total_seconds() / 3600:.1f}小时")
+                    
+                    # 从HTTP响应头获取服务器时间
+                    if hasattr(e, 'headers') and e.headers:
+                        server_date = e.headers.get('Date', '')
+                        if server_date:
+                            logger.info(f"   - 服务器时间 (HTTP Date头): {server_date}")
+                            # 尝试解析服务器时间并计算时间差
+                            try:
+                                from email.utils import parsedate_to_datetime
+                                server_time = parsedate_to_datetime(server_date)
+                                time_diff = (utc_time - server_time.replace(tzinfo=None)).total_seconds()
+                                logger.info(f"   - 与服务器时间差: {time_diff:.1f}秒 ({abs(time_diff):.1f}秒{'快' if time_diff > 0 else '慢'})")
+                                if abs(time_diff) > 60:
+                                    logger.warning(f"   ⚠️ 时间差超过60秒，可能导致token验证失败！")
+                            except Exception as parse_err:
+                                logger.debug(f"   无法解析服务器时间: {parse_err}")
+                    
+                    # 6. API调用参数
+                    logger.info(f"📋 API调用参数:")
+                    logger.info(f"   - account_index: {self.account_index}")
+                    logger.info(f"   - market_id: {market_id if market_id is not None else 255}")
+                    logger.info(f"   - auth参数: 已传递 (长度={len(auth_token) if auth_token else 0})")
+                    
+                    logger.info("=" * 80)
+                    
+                    if attempt < max_retries - 1:
+                        logger.info(f"🔄 正在重新生成 token 并重试 (等待 {1.0 * (attempt + 1)} 秒)...")
+                        await asyncio.sleep(1.0 * (attempt + 1))  # 递增等待时间：1秒、2秒
+                        continue
+                    else:
+                        logger.error(f"❌ Token 过期，已重试 {max_retries} 次仍失败")
+                        # 🔥 打印完整的错误堆栈和详细信息
+                        import traceback
+                        logger.error(f"最终错误详情:\n{traceback.format_exc()}")
+                        
+                        # 🔥 提供详细的解决方案建议
+                        logger.error("=" * 80)
+                        logger.error("💡 可能的解决方案:")
+                        logger.error("=" * 80)
+                        logger.error("1. 检查API Key权限:")
+                        logger.error("   - 登录 https://app.lighter.xyz")
+                        logger.error("   - 检查API Key是否有查询订单的权限")
+                        logger.error("   - 确认API Key未过期或被禁用")
+                        logger.error("")
+                        logger.error("2. 检查系统时间同步:")
+                        logger.error("   - 确保系统时间与服务器时间同步")
+                        logger.error("   - Windows: 运行 'w32tm /resync' 同步时间")
+                        logger.error("")
+                        logger.error("3. 检查SignerClient配置:")
+                        logger.error(f"   - account_index: {self.account_index}")
+                        logger.error(f"   - api_key_index: {self.api_key_index}")
+                        logger.error("   - 确认这些值与Lighter前端显示的配置一致")
+                        logger.error("")
+                        logger.error("4. 检查SDK版本:")
+                        logger.error("   - 当前版本可能不兼容，尝试更新SDK:")
+                        logger.error("   - pip install --upgrade git+https://github.com/elliottech/lighter-python.git")
+                        logger.error("")
+                        logger.error("5. 使用WebSocket替代REST API:")
+                        logger.error("   - WebSocket可能不受此问题影响")
+                        logger.error("   - 检查WebSocket连接是否正常工作")
+                        logger.error("=" * 80)
+                        return []
+                else:
+                    # 非 token 过期错误，直接返回
+                    logger.error(f"获取活跃订单失败: {type(e).__name__}: {e}")
+                    if attempt == max_retries - 1:
+                        import traceback
+                        logger.debug(f"错误详情:\n{traceback.format_exc()}")
+                    return []
 
     async def get_order(self, order_id: str, symbol: str) -> OrderData:
         """

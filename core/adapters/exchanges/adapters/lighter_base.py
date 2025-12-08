@@ -77,21 +77,29 @@ class LighterBase:
         self.api_key_private_key = config.get("api_key_private_key", "")
         self.account_index = config.get("account_index", 0)
         self.api_key_index = config.get("api_key_index", 0)
+        
+        # 🔥 调试：打印私钥信息（不打印完整私钥，只打印长度和前几个字符）
+        if self.api_key_private_key:
+            private_key_len = len(self.api_key_private_key)
+            private_key_preview = self.api_key_private_key[:20] + "..." if private_key_len > 20 else self.api_key_private_key
+            logger.info(f"🔍 [LighterBase] 私钥长度={private_key_len}, 预览={private_key_preview}, account_index={self.account_index}, api_key_index={self.api_key_index}")
+        else:
+            logger.warning("⚠️ [LighterBase] api_key_private_key 为空")
 
         # URL配置
         self.base_url = self.TESTNET_URL if self.testnet else self.MAINNET_URL
         self.ws_url = self.TESTNET_WS_URL if self.testnet else self.MAINNET_WS_URL
 
-        # 覆盖URL（如果配置中提供）
-        if "api_url" in config:
+        # 覆盖URL（如果配置中提供且有效）
+        if "api_url" in config and config["api_url"]:
             self.base_url = config["api_url"]
-        if "ws_url" in config:
+        if "ws_url" in config and config["ws_url"]:
             self.ws_url = config["ws_url"]
 
-        # 🔥 确保ws_url不为None
+        # 🔥 确保ws_url不为None或空字符串
         if not self.ws_url:
             default_ws = self.TESTNET_WS_URL if self.testnet else self.MAINNET_WS_URL
-            logger.warning(f"⚠️ ws_url为空，使用默认值: {default_ws}")
+            logger.debug(f"ws_url未配置，使用默认值: {default_ws}")  # 改为 DEBUG 级别，因为使用默认值是正常的
             self.ws_url = default_ws
 
         # 市场信息缓存

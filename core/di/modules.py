@@ -72,10 +72,12 @@ class DataModule(Module):
 
 
 class MonitoringModule(Module):
-    """监控模块"""
+    """监控模块 - 已废弃"""
     
     def configure(self, binder):
-        binder.bind(MonitoringService, to=EnhancedMonitoringServiceImpl, scope=singleton)
+        # ❌ 监控服务已废弃，不再绑定
+        # binder.bind(MonitoringService, to=EnhancedMonitoringServiceImpl, scope=singleton)
+        pass
 
 
 # 所有模块的集合 - 按依赖顺序排列
@@ -85,5 +87,5 @@ ALL_MODULES = [
     ExchangeModule,     # 交易所管理
     SymbolModule,       # 符号转换和缓存服务
     DataModule,         # 数据聚合
-    MonitoringModule    # 监控服务 - 依赖其他服务
+    # MonitoringModule    # ❌ 监控服务已废弃，已移除
 ] 

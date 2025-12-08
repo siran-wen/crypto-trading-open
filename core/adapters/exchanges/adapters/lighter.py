@@ -154,15 +154,18 @@ class LighterAdapter(ExchangeAdapter):
                 config_dict['testnet'] = api_config.get('testnet', False)
 
                 if self.logger:
-                    self.logger.info("✅ 从lighter_config.yaml加载API配置")
+                    # 🔥 调试：打印私钥信息（不打印完整私钥，只打印长度和前几个字符）
+                    private_key_len = len(config_dict['api_key_private_key'])
+                    private_key_preview = config_dict['api_key_private_key'][:20] + "..." if private_key_len > 20 else config_dict['api_key_private_key']
+                    self.logger.info(f"✅ 从lighter_config.yaml加载API配置: 私钥长度={private_key_len}, 预览={private_key_preview}, account_index={config_dict['account_index']}, api_key_index={config_dict['api_key_index']}")
             except Exception as e:
                 if self.logger:
                     self.logger.warning(f"⚠️ 无法从配置文件加载Lighter配置: {e}")
 
-        # 添加可选配置
-        if hasattr(config, 'api_url'):
+        # 添加可选配置（只有当值有效时才添加）
+        if hasattr(config, 'api_url') and config.api_url:
             config_dict['api_url'] = config.api_url
-        if hasattr(config, 'ws_url'):
+        if hasattr(config, 'ws_url') and config.ws_url:
             config_dict['ws_url'] = config.ws_url
 
         return config_dict
@@ -478,6 +481,8 @@ class LighterAdapter(ExchangeAdapter):
     async def get_open_orders(self, symbol: Optional[str] = None) -> List[OrderData]:
         """
         获取活跃订单
+        
+        🔥 优先使用WebSocket缓存，避免REST API的token过期问题
 
         Args:
             symbol: 交易对符号（可选）
@@ -486,6 +491,23 @@ class LighterAdapter(ExchangeAdapter):
             OrderData列表
         """
         normalized_symbol = self._normalize_symbol(symbol) if symbol else None
+        
+        # 🔥 优先从WebSocket缓存获取订单
+        try:
+            if self._websocket and self._websocket.is_connected():
+                logger.debug(f"🔍 尝试从WebSocket缓存获取订单 (symbol={normalized_symbol})")
+                ws_orders = self._websocket.get_open_orders_from_ws(normalized_symbol)
+                if ws_orders is not None:
+                    logger.info(f"✅ 从WebSocket缓存获取到 {len(ws_orders)} 个活跃订单")
+                    return ws_orders
+                else:
+                    logger.debug("WebSocket缓存中没有订单数据，回退到REST API")
+            else:
+                logger.debug(f"WebSocket未连接 (websocket={self._websocket is not None}, connected={self._websocket.is_connected() if self._websocket else False})，使用REST API")
+        except Exception as e:
+            logger.warning(f"从WebSocket获取订单失败: {e}，回退到REST API", exc_info=True)
+        
+        # 回退到REST API（如果WebSocket不可用）
         return await self._rest.get_open_orders(normalized_symbol)
 
     async def get_positions(self, symbols: Optional[List[str]] = None) -> List[PositionData]:

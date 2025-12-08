@@ -20,9 +20,9 @@ api_config:
   # ACCOUNT_INDEX: 账户索引
   # API_KEY_INDEX: API Key索引
   auth:
-    api_key_private_key: "111111111111111111111111"  # 需要配置
-    account_index: 11111          # 账户索引 (十进制)
-    api_key_index: 2             # API Key索引
+    api_key_private_key: "0x1eaacacdf2cfdaf0a300d2db6248906503b0f7e4c36140475413e276c8b5a9f3ff1bc354a735695f"  # 需要配置
+    account_index: 10347           # 账户索引 (十进制)
+    api_key_index: 8             # API Key索引
   
   # SDK安装说明
   sdk_install_command: "pip install git+https://github.com/elliottech/lighter-python.git"

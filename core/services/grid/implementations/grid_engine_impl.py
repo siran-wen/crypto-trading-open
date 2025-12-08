@@ -219,20 +219,35 @@ class GridEngineImpl(IGridEngine):
             # 注意：不能在 params 中传递 Backpack API 不支持的参数（如 grid_id），
             # 否则会导致签名验证失败！Backpack 支持 clientId 参数
 
-            # 🔥 准备保证金模式参数（Lighter交易所必需）
-            # margin_mode: "isolated"=逐仓(1), "cross"=全仓(0)
-            margin_mode_value = 1 if self.config.margin_mode.lower() == "isolated" else 0
+            # 🔥 检查交易所类型，准备不同的参数
+            exchange_id = str(self.config.exchange).lower() if self.config.exchange else ''
+            
+            # 🔥 检查交易所是否支持 batch_mode 参数（仅 Lighter 支持）
+            import inspect
+            create_order_sig = inspect.signature(self.exchange.create_order)
+            supports_batch_mode = 'batch_mode' in create_order_sig.parameters
 
-            exchange_order = await self.exchange.create_order(
-                symbol=self.config.symbol,
-                side=exchange_side,
-                order_type=OrderType.LIMIT,  # 只使用限价单
-                amount=order.amount,
-                price=order.price,
-                # ✅ 传递保证金模式（Lighter必需）
-                params={"margin_mode": margin_mode_value},
-                batch_mode=batch_mode  # 🔥 传递批量模式标志（仅Lighter使用）
-            )
+            # 构建下单参数
+            order_kwargs = {
+                "symbol": self.config.symbol,
+                "side": exchange_side,
+                "order_type": OrderType.LIMIT,  # 只使用限价单
+                "amount": order.amount,
+                "price": order.price,
+                "params": {}  # 默认空参数
+            }
+            
+            # 🔥 只在 Lighter 交易所传递 margin_mode 参数
+            if exchange_id == 'lighter':
+                # margin_mode: "isolated"=逐仓(1), "cross"=全仓(0)
+                margin_mode_value = 1 if self.config.margin_mode.lower() == "isolated" else 0
+                order_kwargs["params"]["margin_mode"] = margin_mode_value
+            
+            # 只在支持 batch_mode 的交易所传递该参数
+            if supports_batch_mode:
+                order_kwargs["batch_mode"] = batch_mode
+
+            exchange_order = await self.exchange.create_order(**order_kwargs)
 
             # 🔥 检查返回值是否为None（API调用失败）- 带重试机制
             if exchange_order is None:
@@ -242,15 +257,23 @@ class GridEngineImpl(IGridEngine):
                 await asyncio.sleep(1)  # 等待1秒
 
                 # 重试一次
-                exchange_order = await self.exchange.create_order(
-                    symbol=self.config.symbol,
-                    side=exchange_side,
-                    order_type=OrderType.LIMIT,
-                    amount=order.amount,
-                    price=order.price,
-                    params=None,
-                    batch_mode=batch_mode
-                )
+                retry_kwargs = {
+                    "symbol": self.config.symbol,
+                    "side": exchange_side,
+                    "order_type": OrderType.LIMIT,
+                    "amount": order.amount,
+                    "price": order.price,
+                    "params": {},  # 默认空参数
+                }
+                
+                # 🔥 只在 Lighter 交易所传递 margin_mode 参数
+                if exchange_id == 'lighter':
+                    margin_mode_value = 1 if self.config.margin_mode.lower() == "isolated" else 0
+                    retry_kwargs["params"]["margin_mode"] = margin_mode_value
+                
+                if supports_batch_mode:
+                    retry_kwargs["batch_mode"] = batch_mode
+                exchange_order = await self.exchange.create_order(**retry_kwargs)
 
                 # 如果重试后仍然为None，则抛出异常
                 if exchange_order is None:
@@ -384,7 +407,7 @@ class GridEngineImpl(IGridEngine):
             )
 
             # 🔥 Lighter交易所特殊处理：串行下单（避免nonce冲突）
-            # 其他交易所：并发下单（保持原有性能）
+            # 其他交易所：串行下单，每个订单之间延迟1秒（避免API限流）
             exchange_id = str(self.config.exchange).lower(
             ) if self.config.exchange else ''
             if exchange_id == 'lighter':
@@ -399,9 +422,20 @@ class GridEngineImpl(IGridEngine):
                         results.append(e)
                         self.logger.error(f"订单下单异常: {e}")
             else:
-                # 并发下单当前批次（其他交易所）
-                tasks = [self.place_order(order) for order in batch]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+                # 🔥 串行下单，每个订单之间延迟1秒（避免API限流，如Hyperliquid）
+                self.logger.info(f"🔥 {exchange_id}交易所：使用串行批量下单模式（每个订单延迟1秒）")
+                results = []
+                for idx, order in enumerate(batch):
+                    try:
+                        result = await self.place_order(order, source="批量初始化")
+                        results.append(result)
+                    except Exception as e:
+                        results.append(e)
+                        self.logger.error(f"订单下单失败: {e}")
+                    
+                    # 每个订单之间延迟1秒（最后一个订单不需要延迟）
+                    if idx < len(batch) - 1:
+                        await asyncio.sleep(1.0)
 
             # 统计当前批次结果
             batch_success = 0
@@ -444,7 +478,7 @@ class GridEngineImpl(IGridEngine):
                 failed_orders = []  # 清空失败列表
 
                 # 🔥 Lighter交易所：串行重试（避免nonce冲突）
-                # 其他交易所：并发重试
+                # 其他交易所：串行重试，每个订单之间延迟1秒（避免API限流）
                 exchange_id = str(self.config.exchange).lower(
                 ) if self.config.exchange else ''
                 if exchange_id == 'lighter':
@@ -457,9 +491,19 @@ class GridEngineImpl(IGridEngine):
                         except Exception as e:
                             results.append(e)
                 else:
-                    # 重试失败的订单（并发）
-                    tasks = [self.place_order(order) for order in retry_orders]
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    # 🔥 串行重试，每个订单之间延迟1秒（避免API限流）
+                    results = []
+                    for idx, order in enumerate(retry_orders):
+                        try:
+                            result = await self.place_order(order, source="批量初始化重试")
+                            results.append(result)
+                        except Exception as e:
+                            results.append(e)
+                            self.logger.error(f"订单重试失败: {e}")
+                        
+                        # 每个订单之间延迟1秒（最后一个订单不需要延迟）
+                        if idx < len(retry_orders) - 1:
+                            await asyncio.sleep(1.0)
 
                 retry_success = 0
                 for idx, result in enumerate(results):
